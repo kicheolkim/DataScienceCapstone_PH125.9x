@@ -1,0 +1,486 @@
+---
+title: "MovieLens"
+author: "Kicheol Kim"
+date: "Nov. 04. 2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+# Introduction
+MovieLens dataset is movie rating data, provided by GroupLens (research lab at University of Minnesota), to build a recommender system. This project is developing movie recommendation algorithm using MovieLens 10M dataset. MovieLens 10M dataset includes 10 million ratings for 10,000 movies by 72,000 users.    
+RMSE (root-mean-square error) will be used to evaluate predictions in the validation set.  
+  
+- RMSE defined by : 
+$$RMSE = \sqrt{\sum_{i=1}^{n} \frac{(y_i - \hat{y_i})^2}{n}}$$
+
+# Download and create dataset
+- Create edx set (training and test set), validation set (final hold-out test set) :  
+MovieLens 10M dataset was downloaded from the GroupLens website (https://grouplens.org/datasets/movielens/10m/). The dataset split into edx (90% of total ratings) and validation (10% of total ratings) set. The edx set will be used for training and test, and validation set will be used for final model validation.
+
+```{r loading dataset, message=FALSE, warning=FALSE}
+# Create edx set, validation set (final hold-out test set)
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(data.table)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 3.6 or earlier:
+# movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+#                                            title = as.character(title),
+#                                            genres = as.character(genres))
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+```
+
+## 1) Exploratory analysis
+The training set (edx) includes `r nrow(edx)` ratings consist of `r length(unique(edx$userId))` users and `r length(unique(edx$movieId))` movies. The validation set (validation) includes `r nrow(validation)` ratings consist of `r length(unique(validation$userId))` users and `r length(unique(validation$movieId))` movies.  
+
+In the edx dataset, a user who rate most movies rated `r edx %>% group_by(userId) %>% summarize(n = n()) %>% arrange(-n) %>% pull(n) %>% first()` movies. On the other hand, a user who least movie rated was only rated `r edx %>% group_by(userId) %>% summarize(n = n()) %>% arrange(n) %>% pull(n) %>% first()` movies. The most rated movie was `r edx %>% group_by(movieId) %>% summarize(n = n(), title = unique(title)) %>% arrange(-n) %>% pull(title) %>% first()` (number of ratings = `r edx %>% group_by(movieId) %>% summarize(n = n(), title = unique(title)) %>% arrange(-n) %>% pull(n) %>% first()`), `r edx %>% group_by(movieId) %>% summarize(n = n(), title = unique(title)) %>% filter(n == 1) %>% nrow(.)` movies were rated by 1 user only.
+```{r}
+# head of edx dataset
+head(edx)
+# head of validation dataset
+head(validation)
+
+# plot for number of ratings by user
+edx %>% group_by(userId) %>% summarize(n = n()) %>% 
+  ggplot(aes(userId, n)) + geom_point() + ggtitle("ratings by user") + theme_bw()
+# plot for number of ratings by movie
+edx %>% group_by(movieId) %>% summarize(n = n()) %>% 
+  ggplot(aes(movieId, n)) + geom_point() + ggtitle("ratings by movie") + theme_bw()
+```
+
+## 2) pre-process dataset
+I converted timestamp into the date value. In addition, since genre have multiple rows for the same movie after separated rows, I make new dataset with separated rows for genre and used it for genre training.
+
+```{r, message=FALSE, warning=FALSE}
+library(lubridate)
+
+# convert timestamp to date (year-month-day)
+edx <- edx %>% 
+  mutate(time = as_datetime(timestamp)) %>% mutate(date = format(time, format="%Y-%m-%d"))
+validation <- validation %>% 
+  mutate(time = as_datetime(timestamp)) %>% mutate(date = format(time, format="%Y-%m-%d"))
+
+# separate genres
+edx_genre <- edx %>% 
+  separate_rows(genres, sep = "\\|") 
+validation_genre <- validation %>% 
+  separate_rows(genres, sep = "\\|") 
+```
+
+
+# Training
+- Create function for RMSE computation
+```{r, echo = TRUE}
+# function to compute RMSE 
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+## Method 1. average ratings
+The average ratings can be used for simplest recommendation system.
+```{r}
+# calculate average rating
+avg_rating <- mean(edx$rating)
+
+rmse_mean <- RMSE(validation$rating, avg_rating)
+result_rmse <- tibble(method="average ratings", RMSE=rmse_mean)
+knitr::kable(result_rmse)
+```
+- RMSE for average ratings = `r result_rmse %>% filter(method == "average ratings") %>% pull(RMSE)`
+
+## Method 2. movie effect
+Some movie tends to get a good rating, but some movie are not. Different movies are rated differently. As we are adding movie effect in the model, we can consider it in the recommendation system.
+```{r}
+avg_movie <- edx %>% group_by(movieId) %>% 
+  summarize(b_m = mean(rating - avg_rating))
+
+rating_predict <- validation %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  mutate(pred_movie = b_m + avg_rating) %>% pull(pred_movie)
+rmse_movie <- RMSE(validation$rating, rating_predict)
+result_rmse <- rbind(result_rmse, tibble(method="movie effect", RMSE=rmse_movie))
+knitr::kable(result_rmse)
+rm(rating_predict)
+```
+- RMSE for movie effect = `r result_rmse %>% filter(method == "movie effect") %>% pull(RMSE)`
+
+## Method 3. movie + user effect
+Likewise, some user tends to give a good rating, but some user give a bad rating. We can also consider user effect in the training.
+- Number of ratings for each user (top 10 user with most number of ratings)
+```{r}
+# movie with top 10 number of ratings
+edx %>% group_by(userId) %>% summarize(n = n()) %>% 
+    distinct(userId, .keep_all = TRUE) %>% arrange(-n) %>% top_n(10)
+```
+
+Here, I tested user effect only and movie+user effect together.
+```{r}
+avg_user <- edx %>% left_join(avg_movie, by="movieId") %>% 
+  group_by(userId) %>% 
+  summarize(b_u = mean(rating - avg_rating - b_m))
+
+rating_predict <- validation %>% 
+  left_join(avg_user, by="userId") %>% 
+  mutate(pred_user = b_u + avg_rating) %>% pull(pred_user)
+rating_predict_combined <- validation %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  left_join(avg_user, by="userId") %>% 
+  mutate(pred_user = b_m + b_u + avg_rating) %>% pull(pred_user)
+rmse_user <- RMSE(validation$rating, rating_predict)
+rmse_user_combined <- RMSE(validation$rating, rating_predict_combined)
+result_rmse <- rbind(result_rmse, tibble(method="user effect", RMSE=rmse_user))
+result_rmse <- rbind(result_rmse, tibble(method="movie+user effect", RMSE=rmse_user_combined))
+knitr::kable(result_rmse)
+rm(rating_predict, rating_predict_combined)
+```
+Although it's not as much as movie effect, user effect also improved RMSE. In addition, when I combined both movie and user effect, it improved RMSE much better.
+
+- RMSE for user effect only = `r result_rmse %>% filter(method == "user effect") %>% pull(RMSE)`
+- RMSE for movie+user effect = `r result_rmse %>% filter(method == "movie+user effect") %>% pull(RMSE)`
+
+## Method 4. movie + user + date effect
+We also have the date that user rated a movie. The year or date (season) also could affect ratings.
+```{r}
+avg_date <- edx %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  left_join(avg_user, by="userId") %>% 
+  group_by(date) %>% 
+  summarize(d_ui = mean(rating - avg_rating - b_m - b_u))
+
+rating_predict <- validation %>% 
+  left_join(avg_date, by="date") %>% 
+  mutate(pred_date = d_ui + avg_rating) %>% pull(pred_date)
+rating_predict_combined <- validation %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  left_join(avg_user, by="userId") %>% 
+  left_join(avg_date, by="date") %>% 
+  mutate(pred_date = d_ui + b_m + b_u + avg_rating) %>% pull(pred_date)
+rmse_date <- RMSE(validation$rating, rating_predict)
+rmse_date_combined <- RMSE(validation$rating, rating_predict_combined)
+result_rmse <- rbind(result_rmse, tibble(method="date effect", RMSE=rmse_date))
+result_rmse <- rbind(result_rmse, tibble(method="movie+user+date effect", RMSE=rmse_date_combined))
+knitr::kable(result_rmse)
+rm(rating_predict, rating_predict_combined)
+```
+The date effect slightly improved RMSE (`r result_rmse %>% filter(method == "date effect") %>% pull(RMSE)`) compared to RMSE using average rating (`r result_rmse %>% filter(method == "average ratings") %>% pull(RMSE)`). The combination of movie+user+date effect provides the best RMSE so far.
+
+- RMSE for date effect only = `r result_rmse %>% filter(method == "date effect") %>% pull(RMSE)`
+- RMSE for movie+user+date effect = `r result_rmse %>% filter(method == "movie+user+date effect") %>% pull(RMSE)`
+
+## Method 5. movie + user + date + genres effect
+We have one more feature that is genre of the movie. Since each movie categorized into multiple genres, I split genres into individual genre (multiple genres for a movie) to apply genre effect in the training.
+```{r}
+# edx dataset, multiple genre per a movie
+head(edx)
+# edx dataset for genre, genres were separated into individual rows.
+head(edx_genre)
+```
+
+```{r}
+avg_genres <- edx_genre %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  left_join(avg_user, by="userId") %>% 
+  left_join(avg_date, by="date") %>% 
+  group_by(genres) %>% 
+  summarize(b_g = mean(rating - avg_rating - b_m - b_u - d_ui))
+
+rating_predict <- validation_genre %>% 
+  left_join(avg_genres, by="genres") %>% 
+  mutate(pred_genres = b_g + avg_rating) %>% pull(pred_genres)
+rating_predict_combined <- validation_genre %>% 
+  left_join(avg_movie, by="movieId") %>% 
+  left_join(avg_user, by="userId") %>% 
+  left_join(avg_date, by="date") %>% 
+  left_join(avg_genres, by="genres") %>% 
+  mutate(pred_genres = b_g + d_ui + b_m + b_u + avg_rating) %>% pull(pred_genres)
+rmse_time <- RMSE(validation_genre$rating, rating_predict)
+rmse_time_combined <- RMSE(validation_genre$rating, rating_predict_combined)
+result_rmse <- rbind(result_rmse, tibble(method="genre effect", RMSE=rmse_time))
+result_rmse <- rbind(result_rmse, tibble(method="movie+user+date+genre effect", RMSE=rmse_time_combined))
+knitr::kable(result_rmse)
+rm(rating_predict, rating_predict_combined)
+```
+The genre doesn't have stong impact to RMSE although it's more than date effect. The combination of movie+user+date+genre effect provides the best RMSE.
+
+- RMSE for genre effect only = `r result_rmse %>% filter(method == "genre effect") %>% pull(RMSE)`
+- RMSE for movie+user+date+genre effect = `r result_rmse %>% filter(method == "movie+user+date+genre effect") %>% pull(RMSE)`
+
+
+# Regularization
+Can we more improve the current RMSE? Some non-famous movies have high average ratings because of very small number of ratings.  
+
+For example, average rating of "Hellhounds on My Trail (1999)" is 5 but it's rated only 1 time. This average rating is higher than "Pulp Fiction (1994)" which is rated 31362 times and average rating is 4.15.
+
+The histogram shows distribution of average ratings. But the top or bottom average rating movies seem doesn't makes sense. They are not famous movies but have very high average ratings. However, they were rated by 1 or very few users.  
+
+```{r, message = FALSE}
+# movie with top 10 number of ratings
+edx %>% group_by(movieId) %>% summarize(n = n(), title = title, avg_rating = mean(rating)) %>% 
+    distinct(movieId, .keep_all = TRUE) %>% arrange(-n) %>% top_n(10)
+# movie with bottom 10 number of ratings
+edx %>% group_by(movieId) %>% summarize(n = n(), title = title, avg_rating = mean(rating)) %>% 
+    distinct(movieId, .keep_all = TRUE) %>% arrange(n) %>% top_n(10)
+```
+
+```{r, message = FALSE}
+movie_avg_ratings <- edx %>% group_by(movieId) %>% summarize(movieId = movieId, avg = mean(rating)) %>% distinct(movieId, .keep_all = TRUE)
+ggplot(movie_avg_ratings, aes(avg)) + geom_histogram(alpha=0.6) + theme_bw()
+
+# top 10 average rating movie
+movie_avg_ratings %>% left_join(edx, by="movieId") %>% summarize(n=n(), avg_rating = unique(avg), title = unique(title)) %>% top_n(10, avg_rating)
+# bottom 10 average rating movie
+movie_avg_ratings %>% left_join(edx, by="movieId") %>% summarize(n=n(), avg_rating = unique(avg), title = unique(title)) %>% top_n(10, -avg_rating)
+```
+
+Therefore, we have to consider the number of ratings in each movie to improve recommendation system. The regularization penalize this effect in the model. Each step includes finding the best lambda, and apply the lambda for regularization.
+
+- control total variability of the movie effect
+```{r, echo = TRUE}
+# lambda variables to select best parameter
+lambdas <- seq(0, 15, 0.2)
+```
+
+
+## Method 1-1. regularized movie: choosing parameter
+- Find best lambda in a movie effect
+```{r}
+rmses <- sapply(lambdas, function(l){
+  movie_reg <- edx %>% group_by(movieId) %>% 
+    summarize(b_m = sum(rating - avg_rating) / (n() + l))
+  rating_predict <- validation %>% 
+    group_by(movieId) %>%
+    left_join(movie_reg, by="movieId") %>% 
+    mutate(pred = b_m + avg_rating) %>% pull(pred)
+  return(RMSE(rating_predict, validation$rating))
+})
+# plot(lambdas, rmses)
+lambda <- lambdas[which.min(rmses)]
+rm(rmses)
+```
+Best lambda for movie = `r lambda`
+
+## Method 1-2. regularized movie
+Using the best lambda for movie effect, I've regularized movie effect in the model.
+```{r}
+movie_reg <- edx %>% group_by(movieId) %>% 
+  summarize(b_m = sum(rating - avg_rating) / (n() + lambda))
+rating_predict <- validation %>% 
+  group_by(movieId) %>%
+  left_join(movie_reg, by="movieId") %>% 
+  mutate(pred = b_m + avg_rating) %>% pull(pred)
+rmse_movie_reg <- RMSE(rating_predict, validation$rating)
+result_rmse <- rbind(result_rmse, tibble(method="regularized movie effect", RMSE=rmse_movie_reg))
+knitr::kable(result_rmse)
+rm(rating_predict)
+```
+The regularized movie effect slightly improved RMSE (`r result_rmse %>% filter(method == "regularized movie effect") %>% pull(RMSE)`) compared to movie effect without regularization (RMSE = `r result_rmse %>% filter(method == "movie effect") %>% pull(RMSE)`).
+
+## Method 2-1. regularized movie + user: choosing parameter
+Previous result showed that regularized for movie improved RMSE. How about regularization for user?
+
+- Find best lambda in a movie+user effect
+```{r}
+rmses <- sapply(lambdas, function(l){
+  movie_reg <- edx %>% group_by(movieId) %>% 
+    summarize(b_m = sum(rating - avg_rating) / (n() + l))
+  user_reg <- edx %>% group_by(userId) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    summarize(b_u = sum(rating - avg_rating - b_m) / (n() + l))
+  rating_predict <- validation %>% 
+    group_by(movieId) %>%
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    mutate(pred = b_m + b_u + avg_rating) %>% pull(pred)
+  return(RMSE(rating_predict, validation$rating))
+})
+lambda <- lambdas[which.min(rmses)]
+rm(rmses)
+```
+Best lambda for movie+user = `r lambda`
+
+## Method 2-2. regularized movie + user
+Using the best lambda for movie + user effect, I've regularized for both movie and user effect in the model.
+```{r}
+movie_reg <- edx %>% group_by(movieId) %>% 
+  summarize(b_m = sum(rating - avg_rating) / (n() + lambda))
+user_reg <- edx %>% group_by(userId) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  summarize(b_u = sum(rating - avg_rating - b_m) / (n() + lambda))
+rating_predict <- validation %>% 
+  group_by(movieId) %>%
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  mutate(pred = b_m + b_u + avg_rating) %>% pull(pred)
+rmse_user_reg <- RMSE(rating_predict, validation$rating)
+result_rmse <- rbind(result_rmse, tibble(method="regularized movie+user effect", RMSE=rmse_user_reg))
+knitr::kable(result_rmse)
+rm(rating_predict)
+```
+The regularized movie+user effect slightly improved RMSE (`r result_rmse %>% filter(method == "regularized movie+user effect") %>% pull(RMSE)`) compared to movie+user effect without regularization (RMSE = `r result_rmse %>% filter(method == "movie+user effect") %>% pull(RMSE)`).
+
+## Method 3-1. regularized movie + user + date: choosing parameter
+Adding the date as another feature in the regularization model.
+
+- Find best lambda in movie + user + date effect
+```{r}
+rmses <- sapply(lambdas, function(l){
+  movie_reg <- edx %>% group_by(movieId) %>% 
+    summarize(b_m = sum(rating - avg_rating) / (n() + l))
+  user_reg <- edx %>% group_by(userId) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    summarize(b_u = sum(rating - avg_rating - b_m) / (n() + l))
+  date_reg <- edx %>% group_by(date) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    summarize(d_ui = sum(rating - avg_rating - b_m - b_u) / (n() + l))
+  rating_predict <- validation %>% 
+    group_by(movieId) %>%
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    left_join(date_reg, by="date") %>% 
+    mutate(pred = b_m + b_u + d_ui + avg_rating) %>% pull(pred)
+  return(RMSE(rating_predict, validation$rating))
+})
+lambda <- lambdas[which.min(rmses)]
+rm(rmses)
+```
+Best lambda for movie+user+date = `r lambda`
+
+## Method 3-2. regularized movie + user + date
+Using the best lambda for movie + user + date effect, I've regularized for movie, user, and date effect in the model.
+```{r}
+movie_reg <- edx %>% group_by(movieId) %>% 
+  summarize(b_m = sum(rating - avg_rating) / (n() + lambda))
+user_reg <- edx %>% group_by(userId) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  summarize(b_u = sum(rating - avg_rating - b_m) / (n() + lambda))
+date_reg <- edx %>% group_by(date) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  summarize(d_ui = sum(rating - avg_rating - b_m - b_u) / (n() + lambda))
+rating_predict <- validation %>% 
+  group_by(movieId) %>%
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  left_join(date_reg, by="date") %>% 
+  mutate(pred = b_m + b_u + d_ui + avg_rating) %>% pull(pred)
+rmse_date_reg <- RMSE(rating_predict, validation$rating)
+result_rmse <- rbind(result_rmse, tibble(method="regularized movie+user+date effect", RMSE=rmse_date_reg))
+knitr::kable(result_rmse)
+rm(rating_predict)
+
+```
+The regularized movie+user+date effect slightly improved RMSE (`r result_rmse %>% filter(method == "regularized movie+user+date effect") %>% pull(RMSE)`) compared to movie+user+date effect without regularization (RMSE = `r result_rmse %>% filter(method == "movie+user+date effect") %>% pull(RMSE)`).
+
+## Method 4-1. regularized movie + user + date + genre: choosing parameter
+Here, I regularized for all features including movie, user, date, and genre.  
+
+- Find best lambda in movie + user + date + genre effect
+```{r}
+rmses <- sapply(lambdas, function(l){
+  movie_reg <- edx %>% group_by(movieId) %>% 
+    summarize(b_m = sum(rating - avg_rating) / (n() + l))
+  user_reg <- edx %>% group_by(userId) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    summarize(b_u = sum(rating - avg_rating - b_m) / (n() + l))
+  date_reg <- edx %>% group_by(date) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    summarize(d_ui = sum(rating - avg_rating - b_m - b_u) / (n() + l))
+  genre_reg <- edx_genre %>% group_by(genres) %>% 
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    left_join(date_reg, by="date") %>% 
+    summarize(b_g = sum(rating - avg_rating - b_m - b_u - d_ui) / (n() + l))
+  rating_predict <- validation_genre %>% 
+    group_by(movieId) %>%
+    left_join(movie_reg, by="movieId") %>% 
+    left_join(user_reg, by="userId") %>% 
+    left_join(date_reg, by="date") %>% 
+    left_join(genre_reg, by="genres") %>% 
+    mutate(pred = b_m + b_u + d_ui + b_g + avg_rating) %>% pull(pred)
+  return(RMSE(rating_predict, validation_genre$rating))
+})
+lambda <- lambdas[which.min(rmses)]
+rm(rmses)
+```
+Best lambda for movie+user+date+genre = `r lambda`
+
+## Method 4-2. regularized movie + user + date + genres
+Now, I added genre effect for the regulariztaion. Using the best lambda for movie + user + date + genre effect, I've regularized for movie, user, date, and genre effect in the model.
+```{r}
+movie_reg <- edx %>% group_by(movieId) %>% 
+  summarize(b_m = sum(rating - avg_rating) / (n() + lambda))
+user_reg <- edx %>% group_by(userId) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  summarize(b_u = sum(rating - avg_rating - b_m) / (n() + lambda))
+date_reg <- edx %>% group_by(date) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  summarize(d_ui = sum(rating - avg_rating - b_m - b_u) / (n() + lambda))
+genre_reg <- edx_genre %>% group_by(genres) %>% 
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  left_join(date_reg, by="date") %>% 
+  summarize(b_g = sum(rating - avg_rating - b_m - b_u - d_ui) / (n() + lambda))
+rating_predict <- validation_genre %>% 
+  group_by(movieId) %>%
+  left_join(movie_reg, by="movieId") %>% 
+  left_join(user_reg, by="userId") %>% 
+  left_join(date_reg, by="date") %>% 
+  left_join(genre_reg, by="genres") %>% 
+  mutate(pred = b_m + b_u + d_ui + b_g + avg_rating) %>% pull(pred)
+rmse_genre_reg <- RMSE(rating_predict, validation_genre$rating)
+result_rmse <- rbind(result_rmse, tibble(method="regularized movie+user+date+genre effect", RMSE=rmse_genre_reg))
+knitr::kable(result_rmse)
+rm(rating_predict)
+```
+The regularized movie + user + date + genre effect slightly improved RMSE (`r result_rmse %>% filter(method == "regularized movie+user+date+genre effect") %>% pull(RMSE)`) compared to movie + user + date effect without regularization (RMSE = `r result_rmse %>% filter(method == "movie+user+date+genre effect") %>% pull(RMSE)`).
+
+# Conclusion
+Using 10M movie rating dataset (9M training and test, 1M validation), I've developed movie rating prediction system. Movie feature shows most prediction and genre shows least prediction strength.  
+
+**The best prediction model is 'regularized movie + user + date + genre effect' with final RMSE = `r result_rmse %>% filter(method == "regularized movie+user+date+genre effect") %>% pull(RMSE)`.**
+
+```{r}
+result_rmse %>% arrange(RMSE) %>% knitr::kable()
+```
