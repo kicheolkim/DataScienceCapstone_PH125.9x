@@ -1,13 +1,20 @@
-###################################################################################################
-##### Capstone - Choose Your Own project #####
-###################################################################################################
-# if (!require("BiocManager", quietly = TRUE))
-#   install.packages("BiocManager")
-# BiocManager::install(version = "3.14")
-# BiocManager::install("tximport")
-# BiocManager::install("DESeq2")
-# BiocManager::install("GEOquery")
+---
+title: "HarvardX PH125.9x Capstone CYO (Choose Your Own) project - Early autoimmune biomarker for multiple sclerosis"
+author: "Kicheol Kim"
+date: "Feb. 5. 2022"
+output: pdf_document
+---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+# Introduction
+Multiple sclerosis (MS) is a neurodegenerative autoimmune disease of the central nervous system caused by demyelination. The international multiple sclerosis genetics consortium (IMSGC) identified identified more than 200 independent risk loci in multiple sclerosis through genome-wide association studies. Further studies shown that most of risk loci harbor genes expressed in immune cells such as T cells. Multiple sclerosis have 4 different type of disease course according to the [National MS Society](https://www.nationalmssociety.org/What-is-MS/Types-of-MS). CIS (clinically isolated syndrome) is a first episode of inflammation and demyelination. CIS may or may not go on to develop MS. RRMS (relapsing-remitting MS) is the most common disease course. RRMS experiences neurological attack (relapse/exacerbation) followed by periods of recovery (remission). SPMS (secondary progressive MS) follows initial RR courses.Some RRMS patients will transition to secondary progressive course which is progressive worsening of neurologic function. PPMS (primary progressive MS) is progressive worsening of neurologic function from the onset of the disease.
+
+Kim et al. (2021; PMID [33374005](https://pubmed.ncbi.nlm.nih.gov/33374005/)) published post-translational modification in CD4+ T cells is critical in MS pathogenesis. This publication provides CD4+ T cell transcriptome dataset from early diagnosed multiple sclerosis patients. Therefore, in this analysis, I used differential expression analysis and machine learning techniques to identify potential early biomarker for autoimmune response in MS.
+
+```{r loading packages, message=FALSE, warning=FALSE}
 invisible(
   lapply(c("curl","GEOquery","tidyverse","DESeq2","tximport","RColorBrewer",
            "pheatmap","ggbeeswarm","grid","gridExtra","caret","pROC"), 
@@ -17,13 +24,12 @@ invisible(
 rm(list = ls())
 workDir <- getwd()
 
+```
 
+The dataset (gene expression) has been downloaded from GEO (Accession No. [GSE137143](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE137143)). This dataset includes 3 different cell types (CD4+ T cell, CD8+ T cells, CD14+ monocytes). Since I have interested in CD4+ T cells, I kept only CD4+ cells and removed CD8+ and CD14+ cells.
 
+```{r loading dataset, message=FALSE, warning=FALSE}
 ##### Loading and QC dataset ####
-# The dataset (gene expression) has been downloaded from GEO (Acc. GSE137143; https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE137143)
-# This dataset includes 3 different cell types (CD4+ T cell, CD8+ T cells, CD14+ monocytes). 
-# Since I have interested in CD4+ T cells, I kept only CD4+ T cells and removed CD8+ & CD14+ cells.
-
 ### Metadata - downloading from GEO
 gse <- getGEO("GSE137143", GSEMatrix=TRUE)
 sTable <- pData(phenoData(gse[[1]]))[,c(1,48:54)]
@@ -52,14 +58,21 @@ sTable$AgeAtExamGrp <- cut(sTable$age.at.exam, breaks=c(10, 30, 40, 50, 60, 90),
 row.names(sTable) <- sTable$sampleID
 rm(gse)
 
-# select CD4 cells for further analysis
+# select CD4+ T cell samples for further analysis
 sTable.cd4 <- sTable %>% filter(cell.type2 %in% "CD4")
+dim(sTable.cd4)
+head(sTable.cd4)
+
+```
 
 
+# Methods and Analysis
 
-###### Count dataset - CD4 cells ####
-## I've downloaded RSEM outputs from GEO (https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE137143&format=file) and decompressed all files.
-## Count matrix created using tximport.
+## 1. Download dataset
+I have downloaded RSEM outputs from [GEO (Acc. No. GSE137143)](https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE137143&format=file) and decompressed downloaded file. The count matrix created using tximport package.
+
+```{r DESeq2 dataset preparation, message=FALSE, warning=FALSE}
+## Loading RSEM gene counts from GEO. This step will take some time because the file size of the RSEM counts dataset is about 1.1Gb.
 curl_download("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE137nnn/GSE137143/suppl/GSE137143_RAW.tar", destfile = paste0(workDir, "/GSE137143_RAW.tar"), quiet = FALSE)
 untar(tarfile = "GSE137143_RAW.tar", exdir = "GSE137143_RAW")
 ## Because I will use only CD4+ cells, I removed gene counts for CD8+ and CD14+ cells
@@ -79,21 +92,25 @@ rsem.genes.cd4 <- tximport(files.cd4, type = "rsem", txIn = FALSE, txOut = FALSE
 rsem.genes.cd4$length[rsem.genes.cd4$length == 0] <- 1
 # save(rsem.genes.cd4, file = "rsem.genes.cd4.RData")
 
+
 # ## Loading RSEM gene counts from saved R object
 # ## Since downloading count dataset takes some time. I've downloaded and saved RSEM dataset already.
-# ## I cannot upload RSEM dataset file into Github because this file size is exceeding 25MB.
+# ## I tried to upload this file into Github but I couldn't because this file size is exceeding 25MB.
 # load(paste0(workDir,"/rsem.genes.cd4.RData"))
 
+```
 
+## 2. Normalization and differential expression analysis using DESeq2
+The gene expression counts were normalized using DESeq2 and transformed by variance stabilization transformation for machine learning model building.
 
-### Normalization of gene expression using DESeq2 and variance stabilization transformation with all samples
-# ## loading count matrix from prepared data. R code for this matrix is in above.
-# load(paste0(workDir,"/rsem.genes.cd4.RData"))
+Here, I used differential expression analysis model design like this in the DESeq2: $$\sim diseaseSubtype+gender+age-1$$ I would like to compare in disease, and gender and age are covariates. I used all dataset for normalization and dispersion calculation. Since There are 3 different disease courses and healthy controls, I added '- 1' variable to get individual disease subtype and compare between single disease subtype and healthy control.
 
-## confirm matching between 'column of sample table' and 'row of count table'
-mean(colnames(rsem.genes.cd4$counts) == sTable.cd4$sampleID)
+```{r DESeq2 normalization, message=TRUE, warning=FALSE}
+## Normalization of gene expression using DESeq2
+# # confirm matching between 'columns of sample table' and 'rows of count table'
+# mean(colnames(rsem.genes.cd4$counts) == sTable.cd4$sampleID)
 
-## running DESeq2 and get normalized count matrix & vst transformed matrix
+## running DESeq2 and get normalized count matrix
 cds <- DESeqDataSetFromTximport(txi = rsem.genes.cd4, 
                                 colData = sTable.cd4, 
                                 design = ~ disease.subtype2 + gender + AgeAtExamGrp - 1)
@@ -101,9 +118,14 @@ cds <- cds[ rowSums(counts(cds)) > 1, ]
 cds <- DESeq(cds)
 
 rm(rsem.genes.cd4, files.cd4)
+```
 
+#### PCA plot and outlier samples
+PCA plot showed 2 outlier samples in CD4+ T cell samples. Therefore, I removed these outlier samples from the DESeq2 object. Then count data transformed by variance stabilization transformation for further machine learning analysis.
 
+Gene expression of immune cells are affected by gender. In the PCA plot, I observed 2 major clusters that separated by gender. Therefore, gender effect is important in the analysis of immune cells, also critical to use gender as a covariate.
 
+```{r PCA plot for QC, message=TRUE, warning=FALSE}
 ###### PCA plot to checking outlier samples ####
 vst.cds <- vst(cds, blind = TRUE)
 pcaData <- plotPCA(vst.cds, intgroup=c("disease.state2", "gender"), ntop=10000, returnData = TRUE)
@@ -115,10 +137,7 @@ ggplot(pcaData, aes(PC1, PC2, color=disease.state2, shape=gender, label = name))
 
 rm(vst.cds, percentVar, pcaData)
 
-
-
-##### Differential expression analysis without outlier samples ####
-### Normalization and differential expression analysis without outlier samples
+### Normalization and transform counts without outlier samples
 ## based on PCA plot, considered 2 samples as outliers: 75216a-CD4, 84917a-CD4
 sTable.cd4 <- sTable.cd4 %>% filter(!sampleID %in% c("75216a-CD4", "84917a-CD4"))
 
@@ -139,41 +158,17 @@ ggplot(pcaData, aes(PC1, PC2, color = gender, shape = disease.state2, label = na
 
 rm(percentVar, pcaData)
 
+```
 
+## 3. Prepare dataset for machine learning
+Although some CIS patient may not develop to MS, CIS is beginning of the MS disease course. In addition, there was almost no difference between CIS and RRMS in previous analysis (results does not shown here). Therefore, I performed differential expression analysis between CIS and healthy control to remove noise then used top significant genes for model building.
 
-###### DEG (differentially expressed genes) ####
-### get DESeq2 results
-res_hc_cis <- results(cds, alpha=0.1, contrast=c("disease.subtype2","HC","CIS"))
+Next, because I want to compare between CIS and healthy controls, I excluded other disease course samples. Then selected samples were randomly split into training (80%) and test (20%) samples.
+
+```{r DEG and machine learning prep, message=TRUE, warning=FALSE}
+### get DESeq2 results - DEG
+res_hc_cis <- results(cds, alpha=0.1, contrast=c("disease.subtype2","CIS","HC"))
 res_hc_cis_df <- as.data.frame(res_hc_cis) %>% arrange(pvalue)
-
-summary(res_hc_cis)
-
-
-
-###### Heatmap ####
-heatmap.expr <- heatmap.expr <- assay(normTransform(cds))
-heatmap.expr <- heatmap.expr - rowMeans(heatmap.expr)
-
-select <- c(res_hc_cis_df %>% rownames_to_column("gene") %>%  filter(baseMean > 1) %>% 
-              arrange(pvalue) %>% top_n(100, -pvalue) %>% pull(gene))
-length(select)
-
-df <- data.frame(Subtype = sTable.cd4$disease.subtype2, Status = sTable.cd4$disease.state2)
-row.names(df) <- sTable.cd4$sampleID
-pheatmap(heatmap.expr[select,], color = colorRampPalette(rev(brewer.pal(n = 11, name ="RdBu")))(100),   
-         scale = "row", clustering_distance_rows = "euclidean", 
-         clustering_distance_cols = "euclidean", clustering_method = "ward.D2", 
-         cluster_rows=TRUE, cluster_cols=TRUE, fontsize = 8, 
-         show_rownames=FALSE, show_colnames = FALSE, annotation_col=df,
-         main = "Heatmap with DEG top 100")  
-
-rm(select, df, heatmap.expr)
-
-
-
-
-##### Machine learning ####
-###  
 
 ## select CIS and HC samples only
 sTable.cd4.cis <- sTable.cd4 %>% filter(disease.subtype2 %in% c("HC","CIS")) %>% 
@@ -181,6 +176,7 @@ sTable.cd4.cis <- sTable.cd4 %>% filter(disease.subtype2 %in% c("HC","CIS")) %>%
 
 ## variance stabilization transformed counts
 count.vst <- assay(vst.cds)
+## select CIS and HC samples only
 count.vst <- count.vst[, sTable.cd4.cis$sampleID]
 dim(count.vst)
 
@@ -191,7 +187,12 @@ train_set <- t(count.vst[,-test_idx])
 test_set_meta <- sTable.cd4.cis[test_idx,]
 train_set_meta <- sTable.cd4.cis[-test_idx,]
 
-## function to retrieve modeling output
+```
+
+I created a function to summarize modeling results of machine learning.
+
+```{r machine learning result function, message=TRUE, warning=FALSE, echo=TRUE}
+## function to retrieve model fitting results
 fit_output <- function(fit, test_set, test_set_meta, model_name, gene_n){
   confusionMatrix <- confusionMatrix(predict(fit, test_set), test_set_meta$disease.subtype2)
   confusionMatrix
@@ -211,16 +212,19 @@ fit_output <- function(fit, test_set, test_set_meta, model_name, gene_n){
   
   return(ml_res)
 }
+```
 
+## 4. Try multiple modeling methods with various number of genes
+I have run 5 different modeling methods (lda, rf, glmnet, knn, svmlinear) with 10 different number of analytes (100 genes ~ 1000 genes). 
 
-###### 1. Find best method and number of analytes ####
-### repeat 5 different modeling methods (lda, rf, glmnet, knn, svmlinear) with 10 different number of analytes (100 genes ~ 1000 genes)
-set.seed(12345, sample.kind="Rounding")
+```{r machine learning 1, message=FALSE, warning=FALSE}
+set.seed(11111, sample.kind="Rounding")
 gene_n <- seq(100, 1000, 100)
 
 ml_res_num <- data.frame(Method = character(), NumAnalyte = numeric(), AUC = numeric(), 
                      Accuracy = numeric(), Sensitivity = numeric(), Specificity = numeric())
 for (gene_n in gene_n){
+  set.seed(11111, sample.kind="Rounding")
   topGenes <- res_hc_cis_df %>% rownames_to_column("gene") %>% 
     filter(!is.na(padj)) %>% top_n(gene_n, -pvalue) %>% pull(gene)
   
@@ -262,29 +266,64 @@ ml_res_num %>%
   ggtitle(paste("Best method and number of analytes for AUC"))
 
 ml_res_num %>% arrange(-Accuracy, -as.numeric(AUC))
+```
 
 
+## 5. Model building with best model and number of genes
 
-###### 2. rf: Random Forest ####
-set.seed(12345, sample.kind="Rounding")
-
-### Because dataset is small, random split cannot reflect heterogeneity of human samples. 
-### Therefore, I used 5-fold cross validation in the modeling
+```{r random forest training, message=TRUE, warning=FALSE}
+## 5-fold cross-validation
 train_control <- trainControl(method="cv", number=10, savePredictions = TRUE)
 
 ## based on previous analysis, I choose random forest for final modeling
 ml_res_num_rf <- ml_res_num %>% filter(Method == "rf")
-## select number of analytes that showed best AUC in previous test
-gene_n_best <- min(ml_res_num_rf$NumAnalyte[which(ml_res_num_rf$AUC == max(ml_res_num_rf$AUC))])
+## select number of analytes that showed best accuracy in previous test
+gene_n_best <- min(ml_res_num_rf$NumAnalyte[which(ml_res_num_rf$Accuracy == max(ml_res_num_rf$Accuracy))])
 ## select 100 most significant genes, 100 number is based on previous observation (best performance in random forest)
 topGenes <- res_hc_cis_df %>% rownames_to_column("gene") %>% 
   filter(!is.na(padj)) %>% top_n(gene_n_best, -pvalue) %>% pull(gene)
 
 ## random forest modeling
+set.seed(11111, sample.kind="Rounding")
 rf_fit <- train(x=t(count.vst)[,topGenes], y=sTable.cd4.cis$disease.subtype2, 
                 method="rf", trControl=train_control,
                 ntree = 3000, importance = TRUE)
+```
 
+Based on previous test modeling, random forest method with `r min(ml_res_num_rf$NumAnalyte[which(ml_res_num_rf$Accuracy == max(ml_res_num_rf$Accuracy))])` genes showed best performance. Therefore, I repeat modeling using random forest with `r min(ml_res_num_rf$NumAnalyte[which(ml_res_num_rf$Accuracy == max(ml_res_num_rf$Accuracy))])` top statistically significant genes. In the current random forest run, I used 5-fold cross validation in the modeling because data size is small. The random split cannot reflect heterogeneity of human samples with small dataset.
+
+
+# Results
+## 1. Results of differential expression analysis
+In the differential expression analysis, I've found `r res_hc_cis_df %>% filter(padj < 0.1) %>% summarise(n=n())` statistically significant genes (adjusted p-value < 0.1; `r res_hc_cis_df %>% filter(padj < 0.1, log2FoldChange > 0) %>% summarise(n=n())` up-regulated and `r res_hc_cis_df %>% filter(padj < 0.1, log2FoldChange < 0) %>% summarise(n=n())` down-regulated in MS). The heatmap shows top 100 differentially expressed genes (DEG). I observed separation between healthy controls and MS.
+
+```{r differential expression analysis results, message=TRUE, warning=FALSE}
+## summary of differential expression analysis between CIS and HC
+summary(res_hc_cis)
+
+###### Heatmap ####
+heatmap.expr <- heatmap.expr <- assay(normTransform(cds))
+heatmap.expr <- heatmap.expr - rowMeans(heatmap.expr)
+
+select <- c(res_hc_cis_df %>% rownames_to_column("gene") %>%  filter(baseMean > 1) %>% 
+              arrange(pvalue) %>% top_n(100, -pvalue) %>% pull(gene))
+length(select)
+
+df <- data.frame(Subtype = sTable.cd4$disease.subtype2, Status = sTable.cd4$disease.state2)
+row.names(df) <- sTable.cd4$sampleID
+pheatmap(heatmap.expr[select,], color = colorRampPalette(rev(brewer.pal(n = 11, name ="RdBu")))(100),   
+         scale = "row", clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", clustering_method = "ward.D2", 
+         cluster_rows=TRUE, cluster_cols=TRUE, fontsize = 8, 
+         show_rownames=FALSE, show_colnames = FALSE, annotation_col=df,
+         main = "Heatmap with top 100 DEG")  
+
+rm(select, df, heatmap.expr)
+```
+
+## 2. Results of random forest modeling
+
+```{r machine learning results, message=FALSE, warning=FALSE}
 ## retrieve predictions from cross-validation
 predictions <- rf_fit$pred %>% filter(mtry == rf_fit$bestTune$mtry)
 predictions$sampleID <- sTable.cd4.cis$sampleID[predictions$rowIndex]
@@ -314,14 +353,22 @@ rf_result <- data.frame(Method = "RF", NumAnalyte = gene_n_best,
                      Sensitivity = confusionMatrix$byClass["Sensitivity"],
                      Specificity = confusionMatrix$byClass["Specificity"],
                      row.names = NULL)
+rf_result
 
 ## retrieve importance scores
 rf_imp <- varImp(rf_fit)
 rf_imp <- as.data.frame(rf_imp$importance) %>% rownames_to_column("gene") %>% 
   select(-HC) %>% arrange(-CIS) %>% dplyr::rename(Importance = CIS)
 randomForest::varImpPlot(rf_fit$finalModel, cex = 0.5, main = "Importance scores of genes in the model")
+```
+
+In the modeling using random forest with `r rf_result$NumAnalyte` genes, **accuracy was `r rf_result$Accuracy`** and **AUC was `r rf_result$AUC`**.
 
 
+## 3. Comparison between differentially expressed genes (DEG) and random forest results
+I compared between adjusted p-value from differential expresison analysis and imporance score from random forest. This plot indicates differentially expression result and random forest modeling are not consistent. Some genes are shows very low adjusted p-value from differential expression analysis but not well performed in random forest, or vice versa.
+
+```{r comparison between DEG and machine learning, message=FALSE, warning=FALSE}
 ## adding random forest results into DEG result table
 res_hc_cis_df <- res_hc_cis_df %>% rownames_to_column("gene") %>% 
   left_join(., rf_imp, by="gene")
@@ -331,10 +378,11 @@ res_hc_cis_df %>% filter(!is.na(Importance)) %>%
   mutate(label = str_split(gene, "_", simplify = TRUE)[,2]) %>% 
   ggplot(aes(padj, Importance, label = label)) + geom_point() + geom_label(size = 2) + theme_bw()
 
+```
 
+This is example of expression boxplots for top 6 genes that selected based on random forest importance score.
 
-###### Boxplot for genes with top 6 importance from random forest ####
-## creating boxplot for genes with highest importance score in the random forest results
+```{r boxplot for top 6 genes, message=FALSE, warning=FALSE}
 p <- list()
 for (i in 1:6){
   geneCounts <- plotCounts(cds, gene = rf_imp$gene[i], intgroup = c("disease.subtype2"), returnData = TRUE)
@@ -348,4 +396,14 @@ for (i in 1:6){
 
 grid.arrange(grobs = p, nrow = 2, 
              left = textGrob("log10(DESeq2 normalized count)", rot = 90, vjust = 1))
+
+```
+
+
+# Conclusion
+Multiple sclerosis (MS) is autoimmune condition of the central nervous system. In this study, I analyzed peripheral CD4+ T cells using differential expression analysis method and machine learning to identify early autoimmune response biomarker for MS. I found `r res_hc_cis_df %>% filter(padj < 0.1) %>% summarise(n=n())` differential expressed genes in CIS and used statistically significant genes for model building using the random forest method. The final model achieved **AUC `r rf_result$AUC`** and **accuracy `r rf_result$Accuracy`** using `r rf_result$NumAnalyte` genes.
+
+The genes identified in this study are potential early biomarker for multiple sclerosis that could detect neurological attack from blood. In addition, pathways associated with these genes in immune cells might be potential biomarker or therapeutic target for autoimmunity in CD4+ T cells in MS.
+
+As shown in the PCA plot, the immune cells have strong gender effect. Therefore, I selected top differential expressed genes that tested with gender and age as a covariate in the current study. However, the performance could improve with adjustment of gender effect in the model building.
 
